@@ -23,8 +23,10 @@ Every design document explains the *why* behind each decision, not just what was
     ├── ip-plan.md                # Full IP addressing and VLAN table
     ├── requirements.md           # Project requirements
     ├── vlan-design.md            # VLAN & inter-VLAN routing design rationale
+    ├── acl-design.md             # Firwall ACLs design
     └── verifications/
         └── ospf.md               # OSPF verification — show outputs + analysis
+        └── acl.md                # ACL verification — show outputs + analysis
 ```
 
 ---
@@ -38,7 +40,7 @@ Every design document explains the *why* behind each decision, not just what was
 | WAN serial link            | ✅ Complete    | `config/`                          |
 | Multi-area OSPF            | ✅ Complete    | `doc/verifications/ospf.md`        |
 | DHCP / DNS                 | 🔲 Planned     |                                    |
-| Firewall ACLs              | 🔲 Planned     |                                    |
+| Firewall ACLs              | ✅ Complete    | `doc/acl-design.md` `doc/verifications/acl.md`|
 | Wireshark captures         | 🔲 Planned     | `wireshark/`                       |
 | Topology diagram (draw.io) | 🔲 Planned     | `diagrams/`                        |
 
