@@ -64,16 +64,36 @@ This rule is placed **first** in both ACLs so routing stability is never acciden
 
 ---
 
-## Rule ordering logic
+## Design decision: DHCP relay permit placement (added during DHCP phase)
+
+Once DHCP relay was configured (`ip helper-address` on every VLAN SVI, pointed at the HQ router's DHCP pools — see [`doc/dhcp-design.md`](dhcp-design.md)), relayed DHCP traffic began crossing the same `FastEthernet0/0 in` interface these ACLs already filter. This surfaced a real conflict between two existing design decisions:
+
+- DHCP relay is unicast UDP (client port 68 → server port 67), sourced from each VLAN's SVI address.
+- The Sales subnets (`10.0.30.0/24`, `10.1.30.0/24`) have a blanket `deny ip ... any` rule, by policy, positioned early in each ACL (rule 3 in the ordering below).
+
+Since Sales' DHCP relay traffic is *also* sourced from a Sales subnet, it was being caught and dropped by that same deny rule — before ever reaching a DHCP permit line placed near the bottom of the list. Sales PCs could not obtain an address at all until this was fixed.
+
+**Resolution:** the DHCP permit line was inserted **before** the Telnet denies and the Sales deny-all, near the very top of both ACLs (immediately after the OSPF permit). The reasoning: DHCP relay traffic is a request to the local network's own infrastructure service (address assignment), not the cross-site department traffic the Sales deny-all rule was written to block. Those are two different traffic classes that happen to share a source subnet, and the ACL needed to distinguish them explicitly rather than let the broader Sales rule shadow the narrower DHCP one.
+
+```
+15 permit udp any eq 68 any eq 67
+```
+
+This line is intentionally scoped to `any → any` on these specific ports rather than per-subnet, since every VLAN (not just Sales) needs its DHCP relay traffic to pass, and restricting it per-subnet would just recreate the same problem for each department individually.
+
+---
+
+## Rule ordering logic (updated)
 
 Cisco ACLs evaluate top-to-bottom and stop at the first match, so order matters:
 
 1. **`permit ospf any any`** — first, to guarantee routing is never impacted by anything below.
-2. **Telnet denies per subnet** — before any broad permit, so management-plane access is blocked regardless of what data-plane access is later granted.
-3. **Full subnet deny for blocked departments** (Sales) — before the general permits, so Sales traffic never reaches a later `permit ip` line.
-4. **ICMP permits** — explicit, so ping tests can verify reachability independent of the broader IP permits.
-5. **Scoped `permit ip`** — narrowest source/destination pairs allowed by policy (IT → any remote subnet, HR → remote HR only).
-6. **`deny ip any any`** — explicit final catch-all. Functionally redundant (Cisco appends this implicitly), but written explicitly so `show access-lists` reports match counters for it, making unexpected/blocked traffic visible during testing.
+2. **`permit udp any eq 68 any eq 67`** (DHCP relay) — second, so every VLAN's address assignment works regardless of what department-level policy is enforced further down.
+3. **Telnet denies per subnet** — before any broad permit, so management-plane access is blocked regardless of what data-plane access is later granted.
+4. **Full subnet deny for blocked departments** (Sales) — before the general permits, so Sales traffic never reaches a later `permit ip` line.
+5. **ICMP permits** — explicit, so ping tests can verify reachability independent of the broader IP permits.
+6. **Scoped `permit ip`** — narrowest source/destination pairs allowed by policy (IT → any remote subnet, HR → remote HR only).
+7. **`deny ip any any`** — explicit final catch-all. Functionally redundant (Cisco appends this implicitly), but written explicitly so `show access-lists` reports match counters for it, making unexpected/blocked traffic visible during testing.
 
 ---
 
@@ -82,12 +102,13 @@ Cisco ACLs evaluate top-to-bottom and stop at the first match, so order matters:
 ```
 ip access-list extended BRANCH_TO_HQ
  permit ospf any any
+ permit udp any eq 68 any eq 67
  deny tcp 10.1.10.0 0.0.0.255 any eq 23
  deny tcp 10.1.20.0 0.0.0.255 any eq 23
  deny tcp 10.1.30.0 0.0.0.255 any eq 23
  deny ip 10.1.30.0 0.0.0.255 any
  permit icmp 10.1.10.0 0.0.0.255 any
- permit icmp 10.1.20.0 0.0.0.255 any
+ permit icmp 10.1.20.0 0.0.0.255 10.0.20.0 0.0.0.255
  permit ip 10.1.10.0 0.0.0.255 10.0.0.0 0.0.255.255
  permit ip 10.1.20.0 0.0.0.255 10.0.20.0 0.0.0.255
  deny ip any any
@@ -98,12 +119,13 @@ ip access-list extended BRANCH_TO_HQ
 ```
 ip access-list extended HQ_TO_BRANCH
  permit ospf any any
+ permit udp any eq 68 any eq 67
  deny tcp 10.0.10.0 0.0.0.255 any eq 23
  deny tcp 10.0.20.0 0.0.0.255 any eq 23
  deny tcp 10.0.30.0 0.0.0.255 any eq 23
  deny ip 10.0.30.0 0.0.0.255 any
  permit icmp 10.0.10.0 0.0.0.255 any
- permit icmp 10.0.20.0 0.0.0.255 any
+ permit icmp 10.0.20.0 0.0.0.255 10.1.20.0 0.0.0.255
  permit ip 10.0.10.0 0.0.0.255 10.1.0.0 0.0.255.255
  permit ip 10.0.20.0 0.0.0.255 10.1.20.0 0.0.0.255
  deny ip any any
@@ -119,4 +141,5 @@ For each ACL, verification (documented separately in `doc/verifications/acl.md`)
 2. **Positive tests** — pings that should succeed per policy (e.g. Branch IT → HQ Sales host, HQ HR → Branch HR host).
 3. **Negative tests** — pings that should fail per policy (e.g. Branch Sales → any HQ host, HQ Sales → any Branch host).
 4. **Telnet block** — attempted Telnet from a data VLAN host to a router, confirming refusal.
-5. **Match counters** — `show access-lists` after testing, confirming traffic actually hit the expected rules rather than passing through unfiltered.
+5. **DHCP relay** — confirms DHCP requests from every VLAN, including Sales, are permitted through despite the Sales deny-all rule (see [`doc/verifications/dhcp.md`](verifications/dhcp.md)).
+6. **Match counters** — `show access-lists` after testing, confirming traffic actually hit the expected rules rather than passing through unfiltered.

@@ -1,6 +1,6 @@
 # ACL Verification — HQ_TO_BRANCH & BRANCH_TO_HQ
 
-Proof that both inter-site ACLs are correctly placed, do not interfere with OSPF, and enforce the access policy defined in [`doc/acl-design.md`](../acl-design.md). This document records `show` command output and ping test results gathered during testing, including two issues found and fixed along the way.
+Proof that both inter-site ACLs are correctly placed, do not interfere with OSPF, and enforce the access policy defined in [`doc/acl-design.md`](../acl-design.md). This document records `show` command output and ping test results gathered during testing, including issues found and fixed along the way.
 
 ---
 
@@ -108,7 +108,7 @@ no permit icmp 10.1.20.0 0.0.0.255 any
 permit icmp 10.1.20.0 0.0.0.255 10.0.20.0 0.0.0.255
 ```
 
-**Confirmed fixed:** Re-testing after the fix showed HQ HR → Branch HR still succeeds, and HQ HR → Branch IT now correctly fails (see match counters below — line 70 on `HQ_TO_BRANCH` now shows 4 matches from the successful HR→HR test, and line 100's catch-all deny shows 4 matches corresponding to the now-blocked HR→IT attempt).
+**Confirmed fixed:** Re-testing after the fix showed HQ HR → Branch HR still succeeds, and HQ HR → Branch IT now correctly fails.
 
 ---
 
@@ -128,13 +128,37 @@ permit icmp 10.1.20.0 0.0.0.255 10.0.20.0 0.0.0.255
 
 ---
 
+## Finding 3 — DHCP relay silently blocked for all VLANs, then specifically for Sales (found during DHCP phase)
+
+**Context:** discovered while implementing DHCP relay (see [`doc/dhcp-design.md`](../dhcp-design.md)). Not part of the original ACL test pass — DHCP didn't exist yet at that point.
+
+**Symptom 1:** no VLAN could obtain a DHCP address at all, even after `ip helper-address` and DHCP pools were correctly configured.
+
+**Cause:** relayed DHCP traffic is unicast UDP (client port 68 → server port 67), crossing the same `FastEthernet0/0 in` interface these ACLs filter. Neither ACL had any rule permitting this traffic, so it fell through to the final `deny ip any any`.
+
+**Fix:** added, on both ACLs:
+```
+permit udp any eq 68 any eq 67
+```
+
+**Symptom 2:** after the fix above, IT and HR VLANs on both sites obtained addresses correctly, but Sales VLANs (HQ and Branch) still could not.
+
+**Cause:** the DHCP permit line was appended near the bottom of each ACL, **after** the Sales deny-all rule (`deny ip 10.0.30.0 ... any` / `deny ip 10.1.30.0 ... any`). Since Sales' relayed DHCP traffic is sourced from the Sales subnet, it matched the deny-all rule first and never reached the DHCP permit line below it.
+
+**Fix:** moved the DHCP permit line to immediately after the OSPF permit line, near the top of both ACLs — ahead of the Sales deny-all — since DHCP relay is local infrastructure traffic, not the cross-site department traffic the Sales rule was designed to block. See `acl-design.md` for the full reasoning.
+
+**Confirmed fixed:** all six VLANs, including both Sales VLANs, now obtain correctly-scoped DHCP addresses. See [`doc/verifications/dhcp.md`](dhcp.md) for full binding output and match counters.
+
+---
+
 ## 4. Final match counters (proof of enforcement)
 
-Captured after the full ping test matrix above, following the Finding 1 fix:
+Captured after the full ping test matrix and DHCP testing:
 
 ```
 Extended IP access list HQ_TO_BRANCH
  10 permit ospf any any (338 match(es))
+ 15 permit udp any eq 68 any eq 67 (24 match(es))
  20 deny tcp 10.0.10.0 0.0.0.255 any eq telnet (24 match(es))
  30 deny tcp 10.0.20.0 0.0.0.255 any eq telnet
  40 deny tcp 10.0.30.0 0.0.0.255 any eq telnet
@@ -147,6 +171,7 @@ Extended IP access list HQ_TO_BRANCH
 
 Extended IP access list BRANCH_TO_HQ
  10 permit ospf any any (369 match(es))
+ 15 permit udp any eq 68 any eq 67 (32 match(es))
  20 deny tcp 10.1.10.0 0.0.0.255 any eq telnet
  30 deny tcp 10.1.20.0 0.0.0.255 any eq telnet
  40 deny tcp 10.1.30.0 0.0.0.255 any eq telnet
@@ -159,15 +184,15 @@ Extended IP access list BRANCH_TO_HQ
 ```
 
 **Reading the counters:**
-- Line 10 (OSPF) on both ACLs shows high match counts — expected, since OSPF hellos are frequent, though as noted this line no longer affects live OSPF traffic given the `FastEthernet0/0` placement (it's a retained safeguard).
+- Line 10 (OSPF) on both ACLs shows high match counts — expected, since OSPF hellos are frequent, though this line no longer affects live OSPF traffic given the `FastEthernet0/0` placement (retained as a safeguard).
+- Line 15 (DHCP relay) match counts on both ACLs confirm DHCP requests from every VLAN — including Sales — are now correctly permitted before hitting any deny rule.
 - `HQ_TO_BRANCH` line 20 (24 matches) confirms Telnet attempts from HQ IT toward router WAN IPs were correctly denied.
-- `HQ_TO_BRANCH` line 50 (21 matches) confirms HQ Sales traffic toward Branch was denied outright.
-- `HQ_TO_BRANCH` line 60 (34 matches) and `BRANCH_TO_HQ` line 60 (43 matches) confirm IT's unrestricted ICMP reachability was exercised and permitted, as intended.
-- Line 70 on both ACLs (4 matches each) confirms the Finding 1 fix is active and being hit by legitimate HR↔HR ping traffic.
-- `HQ_TO_BRANCH` line 100 (4 matches) confirms the now-blocked HQ HR → Branch IT attempt was correctly caught by the final deny after the fix.
+- `HQ_TO_BRANCH` line 50 (21 matches) confirms HQ Sales *data* traffic toward Branch was still denied outright — DHCP relay is the only exception carved out for Sales.
+- Line 60/70 confirm IT and HR's scoped ICMP reachability, as intended.
+- `HQ_TO_BRANCH` line 100 (4 matches) confirms the blocked HQ HR → Branch IT attempt was correctly caught by the final deny.
 
 ---
 
 ## Conclusion
 
-Both ACLs are correctly placed, do not interfere with OSPF, and enforce the access policy as designed — with one bug found and fixed during testing (ICMP over-permission for HR), and one known, documented limitation inherent to stateless ACLs (HQ IT → Branch Sales reply traffic). Match counters confirm real traffic is being evaluated against the expected rules rather than passing through unfiltered.
+Both ACLs are correctly placed, do not interfere with OSPF, and enforce the access policy as designed — with three issues found and resolved during testing: ICMP over-permission for HR (fixed), the stateless-ACL limitation on HQ IT → Branch Sales replies (documented, not fixed — architectural limitation), and DHCP relay traffic being blocked, first entirely, then specifically for Sales due to rule ordering (both fixed). Match counters confirm real traffic is being evaluated against the expected rules rather than passing through unfiltered.
